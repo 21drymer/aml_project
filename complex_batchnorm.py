@@ -1,0 +1,407 @@
+import torch
+from torch import nn
+from typing import Optional
+
+# adapted code from github.com/josiahwsmith10/complextorch
+# this was previously out of date. this just gets it working with current stuff
+
+
+def inv_sqrtm2x2(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    d: torch.Tensor,
+    symmetric: bool = False,
+):
+    r"""
+    Inverse Squareroot of 2x2 Matrix
+    --------------------------------
+
+    Compute the inverse matrix square root of a 2x2 matrix: :math:`A^{-1/2}`
+    Improves computation speed of batch and layer normalization compared with PyTorch matrix inversion.
+
+    Following: https://en.wikipedia.org/wiki/Square_root_of_a_2_by_2_matrix
+
+    Given matrix :math:`\mathbf{A}` as
+
+    .. math::
+
+        \mathbf{A} = \begin{bmatrix} a & b \\ c & d \end{bmatrix}.
+
+    Recall
+
+    .. math::
+
+        \mathbf{A}^{-1} = \frac{1}{\text{det}(\mathbf{A})} \begin{bmatrix} d & -b \\ -c & a \end{bmatrix}.
+
+    We define two parameters
+
+    .. math::
+
+        \delta &\triangleq \text{det}(\mathbf{A}) = ad - bc,
+
+        \tau &\triangleq \text{trace}(\mathbf{A}) = a + d.
+
+    Using :math:`\delta` and :math:`\tau`, we define two parameters to establish the relationship between :math:`\mathbf{A}` and its matrix square root :math:`\mathbf{A}^{1/2}` as
+
+    .. math::
+
+        s \triangleq \sqrt{\delta},
+
+        t \triangleq \sqrt{\tau + 2s}.
+
+    The matrix square root can be expressed as
+
+    .. math::
+
+        \mathbf{A}^{1/2} = \frac{1}{t} \begin{bmatrix} a+s & b \\ c & d+s \end{bmatrix}.
+
+    Hence, the inverse of the matrix square root can be defined as
+
+    .. math::
+
+        \mathbf{A}^{-1/2} = \frac{1}{st} \begin{bmatrix} d+s & -b \\ -c & a+s \end{bmatrix}.
+
+    Finally, defining
+
+    .. math::
+
+        \mathbf{B} \triangleq \begin{bmatrix} w & x \\ y & z \end{bmatrix} \triangleq \mathbf{A}^{-1/2}.
+
+    Hence,
+
+    .. math::
+
+        w &= \frac{d + s}{st},
+
+        x &= \frac{-b}{st},
+
+        y &= \frac{-c}{st},
+
+        z &= \frac{a + s}{st}.
+
+    Args:
+        a (torch.Tensor): a11 element of matrix A
+        b (torch.Tensor): a12 element of matrix A
+        c (torch.Tensor): a21 element of matrix A
+        d (torch.Tensor): a22 element of matrix A
+        symmetric (bool, optional): Boolean whether or not matrix A is symmetric. Defaults to False.
+
+    Returns:
+        Tuple[torch.Tensor]: :math:`w, x, y, z` elemets of matrix B, the matrix inverse square root of matrix A
+    """
+
+    if symmetric:
+        # If A is symmetric, b == c and x == y
+        # Hence, we ignore c and y to save one multiplaction
+        delta = a * d - b * b
+        tau = a + d
+
+        s = torch.sqrt(delta)
+        t = torch.sqrt(tau + 2 * s)
+
+        coeff = 1 / (s * t)
+
+        w, z = coeff * (d + s), coeff * (a + s)
+        x, y = -coeff * b, None
+    else:
+        delta = a * d - b * c
+        tau = a + d
+
+        s = torch.sqrt(delta)
+        t = torch.sqrt(tau + 2 * s)
+
+        coeff = 1 / (s * t)
+
+        w, z = coeff * (d + s), coeff * (a + s)
+        x, y = -coeff * b, -coeff * c
+
+    return w, x, y, z
+
+
+def _whiten2x2_batch_norm(
+    x: torch.Tensor,
+    training: bool = True,
+    running_mean: Optional[torch.Tensor] = None,
+    running_cov: Optional[torch.Tensor] = None,
+    momentum: float = 0.1,
+    eps: float = 1e-5,
+):
+    r"""Performs 2x2 whitening for batch normalization
+
+    Args:
+        x (torch.Tensor): Input tensor of size 2 x B x F x ...
+        training (bool, optional): Boolean if in training mode. Defaults to True.
+        running_mean (torch.Tensor, optional): Running mean to track. Defaults to None.
+        running_cov (torch.Tensor, optional): Running covariance matrices to track. Defaults to None.
+        momentum (float, optional): The weight in the exponential moving average used to keep track of the running feature statistics. Defaults to 0.1.
+        eps (float, optional): The ridge coefficient to stabilize the estimate of the covariance. Defaults to 1e-5.
+
+    Returns:
+        torch.Tensor : Batch normalized data
+    """
+    # assume tensor is 2 x B x F x ...
+    assert x.dim() >= 3
+
+    # Axes over which to compute mean and covariance
+    axes = 1, *range(3, x.dim())
+
+    # tail shape for broadcasting ? x 1 x F x [*1]
+    tail = 1, x.shape[2], *([1] * (x.dim() - 3))
+
+    # Compute the batch mean [2, F]
+    if training or running_mean is None:
+        mean = x.mean(dim=axes, keepdim=True)
+        if running_mean is not None:
+            running_mean += momentum * (mean.data.squeeze() - running_mean)
+
+    else:
+        mean = running_mean
+
+    # Center the batch
+    x -= mean
+
+    # Compute the batch covariance [2, 2, F]
+    if training or running_cov is None:
+        var = (x * x).mean(dim=axes) + eps
+        v_rr, v_ii = var[0], var[1]
+
+        v_ir = (x[0] * x[1]).mean([a - 1 for a in axes])
+        if running_cov is not None:
+            cov = torch.stack(
+                [
+                    v_rr.data,
+                    v_ir.data,
+                    v_ir.data,
+                    v_ii.data,
+                ],
+                dim=0,
+            ).view(2, 2, -1)
+            running_cov += momentum * (cov - running_cov)
+
+    else:
+        v_rr, v_ir, v_ir, v_ii = running_cov.view(4, -1)
+
+    # Compute inverse matrix square root for ZCA whitening
+    p, q, _, s = inv_sqrtm2x2(v_rr, v_ir, None, v_ii, symmetric=True)
+
+    # Whiten the batch
+    return torch.stack(
+        [
+            x[0] * p.view(tail) + x[1] * q.view(tail),
+            x[0] * q.view(tail) + x[1] * s.view(tail),
+        ],
+        dim=0,
+    )
+
+
+def batch_norm(
+    x: torch.Tensor,
+    running_mean: Optional[torch.Tensor] = None,
+    running_var: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    training: bool = True,
+    momentum: float = 0.1,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    r"""
+    Complex-Valued Batch Normalization
+    ----------------------------------
+
+    Applies complex-valued batch normalization as described in
+    (Trabelsi et al., 2018) for each channel across a batch of data.
+
+    Arguments
+    ---------
+    x : torch.Tensor
+        The input complex-valued data is expected to be at least 2d, with
+        shape [B, F, ...], where `B` is the batch dimension, `F` -- the
+        channels/features, `...` -- the spatial dimensions (if present).
+
+    running_mean : torch.tensor, or None
+        The tensor with running mean statistics having shape [2, F]. Ignored
+        if explicitly `None`.
+
+    running_var : torch.tensor, or None
+        The tensor with running real-imaginary covariance statistics having
+        shape [2, 2, F]. Ignored if explicitly `None`.
+
+    weight : torch.tensor, default=None
+        The 2x2 weight matrix of the affine transformation of real and
+        imaginary parts post normalization. Has shape [2, 2, F] . Ignored
+        together with `bias` if explicitly `None`.
+
+    bias : torch.tensor, or None
+        The offest (bias) of the affine transformation of real and imaginary
+        parts post normalization. Has shape [2, F] . Ignored together with
+        `weight` if explicitly `None`.
+
+    training : bool, default=True
+        Determines whether to update running feature statistics, if they are
+        provided, or use them instead of batch computed statistics. If `False`
+        then `running_mean` and `running_var` MUST be provided.
+
+    momentum : float, default=0.1
+        The weight in the exponential moving average used to keep track of the
+        running feature statistics.
+
+    eps : float, default=1e-5
+        The ridge coefficient to stabilize the estimate of the real-imaginary
+        covariance.
+    """
+    # check arguments
+    assert (running_mean is None and running_var is None) or (
+        running_mean is not None and running_var is not None
+    )
+    assert (weight is None and bias is None) or (weight is not None and bias is not None)
+
+    # stack along the first axis
+    x = torch.stack((x, x), dim=0)
+
+    # whiten
+    z = _whiten2x2_batch_norm(
+        x,
+        training=training,
+        running_mean=running_mean,
+        running_cov=running_var,
+        momentum=momentum,
+        eps=eps,
+    )
+
+    # apply affine transformation
+    if weight is not None and bias is not None:
+        shape = 1, x.shape[2], *([1] * (x.dim() - 3))
+        weight = weight.view(2, 2, *shape)
+        z = torch.stack(
+            [
+                z[0] * weight[0, 0] + z[1] * weight[0, 1],
+                z[0] * weight[1, 0] + z[1] * weight[1, 1],
+            ],
+            dim=0,
+        ) + bias.view(2, *shape)
+
+    # FIXME: previously was just torch.complex(z[0], z[1])
+    # i do not believe that this is correct
+    return z[0]
+
+
+class _BatchNorm(nn.Module):
+    r"""
+    Complex-Valued Batch Normalization Base Class
+    ---------------------------------------------
+
+    Closely replicated from torch.nn.modules.batchnorm.
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = True,
+        track_running_stats: bool = True,
+    ) -> None:
+        super().__init__()
+
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+        self.affine = affine
+        self.track_running_stats = track_running_stats
+        if self.affine:
+            self.weight = torch.nn.Parameter(torch.empty(2, 2, num_features))
+            self.bias = torch.nn.Parameter(torch.empty(2, num_features))
+
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+        if self.track_running_stats:
+            self.register_buffer("running_mean", torch.empty(2, num_features))
+            self.register_buffer("running_var", torch.empty(2, 2, num_features))
+            self.register_buffer("num_batches_tracked", torch.tensor(0, dtype=torch.long))
+
+        else:
+            self.register_parameter("running_mean", None)
+            self.register_parameter("running_var", None)
+            self.register_parameter("num_batches_tracked", None)
+
+        self.reset_running_stats()
+        self.reset_parameters()
+
+    def reset_running_stats(self) -> None:
+        if not self.track_running_stats:
+            return
+
+        self.num_batches_tracked.zero_()
+
+        self.running_mean.zero_()
+        self.running_var.copy_(torch.eye(2, 2).unsqueeze(-1))
+
+    def reset_parameters(self) -> None:
+        if not self.affine:
+            return
+
+        self.weight.data.copy_(0.70710678118 * torch.eye(2, 2).unsqueeze(-1))
+        nn.init.zeros_(self.bias)
+
+    def _check_input_dim(self, input) -> None:
+        raise NotImplementedError
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        self._check_input_dim(input)
+
+        if self.momentum is None:
+            exponential_average_factor = 0.0
+        else:
+            exponential_average_factor = self.momentum
+
+        if self.training and self.track_running_stats:
+            if self.num_batches_tracked is not None:
+                self.num_batches_tracked += 1
+                if self.momentum is None:  # use cumulative moving average
+                    exponential_average_factor = 1.0 / float(self.num_batches_tracked)
+                else:  # use exponential moving average
+                    exponential_average_factor = self.momentum
+
+        return batch_norm(
+            input,
+            self.running_mean,
+            self.running_var,
+            self.weight,
+            self.bias,
+            self.training or not self.track_running_stats,
+            exponential_average_factor,
+            self.eps,
+        )
+
+    def extra_repr(self) -> None:
+        return (
+            "{num_features}, eps={eps}, momentum={momentum}, affine={affine}, "
+            "track_running_stats={track_running_stats}".format(**vars(self))
+        )
+
+
+class BatchNorm1d(_BatchNorm):
+    r"""
+    1-D Complex-Valued Batch Normalization
+    --------------------------------------
+
+    Complex-valued batch normalization for 2-D and 3-D tensors.
+    Similar to the `PyTorch BatchNorm1d <https://pytorch.org/docs/stable/generated/torch.nn.BatchNorm1d.html>`_ implementation but performs the proper batch normalization for complex-valued data.
+
+    See `torch.nn.BatchNorm1d <https://pytorch.org/docs/stable/generated/torch.nn.BatchNorm1d.html>`_ for additional details.
+
+    Based on work from the following paper:
+
+        **J. A. Barrachina, C. Ren, G. Vieillard, C. Morisseau, and J.-P. Ovarlez. Theory and Implementation of Complex-Valued Neural Networks.**
+
+            - Section 6
+
+            - https://arxiv.org/abs/2302.08286
+    """
+
+    def _check_input_dim(self, input: torch.Tensor) -> None:
+        if input.dim() != 2 and input.dim() != 3:
+            raise ValueError(f"expected 2D or 3D input (got {input.dim()}D input)")
