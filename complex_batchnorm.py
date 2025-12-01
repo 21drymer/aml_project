@@ -257,7 +257,7 @@ def batch_norm(
     assert (weight is None and bias is None) or (weight is not None and bias is not None)
 
     # stack along the first axis
-    x = torch.stack((x, x), dim=0)
+    x = torch.stack((torch.real(x), torch.imag(x)))
 
     # whiten
     z = _whiten2x2_batch_norm(
@@ -270,6 +270,7 @@ def batch_norm(
     )
 
     # apply affine transformation
+    a = z.isnan()
     if weight is not None and bias is not None:
         shape = 1, x.shape[2], *([1] * (x.dim() - 3))
         weight = weight.view(2, 2, *shape)
@@ -281,9 +282,7 @@ def batch_norm(
             dim=0,
         ) + bias.view(2, *shape)
 
-    # FIXME: previously was just torch.complex(z[0], z[1])
-    # i do not believe that this is correct
-    return z[0]
+    return torch.complex(torch.real(z[0]), torch.imag(z[1]))
 
 
 class _BatchNorm(nn.Module):
