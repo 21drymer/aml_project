@@ -156,7 +156,9 @@ def _whiten2x2_batch_norm(
             running_mean += momentum * (mean.data.squeeze() - running_mean)
 
     else:
-        mean = running_mean
+        # broadcast to the shape [2, 1, F, 1] to be compatible with input
+        # [2, B, F, ...]. make real since its already stacked [real, imag] anyways
+        mean = torch.real(running_mean.view(2, *tail))
 
     # Center the batch
     x -= mean
@@ -257,7 +259,8 @@ def batch_norm(
     assert (weight is None and bias is None) or (weight is not None and bias is not None)
 
     # stack along the first axis
-    x = torch.stack((x, x), dim=0)
+    # x = torch.stack(x.rect, dim=2)
+    x = torch.stack((torch.real(x), torch.imag(x)))
 
     # whiten
     z = _whiten2x2_batch_norm(
@@ -281,9 +284,7 @@ def batch_norm(
             dim=0,
         ) + bias.view(2, *shape)
 
-    # FIXME: previously was just torch.complex(z[0], z[1])
-    # i do not believe that this is correct
-    return z[0]
+    return torch.complex(torch.real(z[0]), torch.imag(z[1]))
 
 
 class _BatchNorm(nn.Module):
