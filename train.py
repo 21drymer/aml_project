@@ -92,17 +92,21 @@ class ConventionalVGG(nn.Module):
     def __init__(self):
         super().__init__()
         self.conv_blocks = nn.Sequential(
-            self.vgg_block_small(2, 1024),
-            self.vgg_block_small(1024, 512),
-            self.vgg_block_big(512, 256),
-            self.vgg_block_big(256, 128),
+            self.vgg_block_small(2, 64),
+            self.vgg_block_small(64, 128),
+            self.vgg_block_small(128, 256),
+            # self.vgg_block_big(128, 128),
+            # self.vgg_block_big(256, 512),
+            # self.vgg_block_big(256, 512),
+            # self.vgg_block_big(256, 512),
+            # self.vgg_block_big(512, 512),
         )
 
         # further downsample with linear layers
         # maybe this is unnecessary just 128 -> 4
-        self.fc1 = nn.Linear(128, 64)
-        self.fc2 = nn.Linear(64, 32)
-        self.fc3 = nn.Linear(32, 4)
+        self.fc1 = nn.Linear(256, 4)
+        # self.fc2 = nn.Linear(64, 32)
+        # self.fc3 = nn.Linear(32, 4)
 
     # copies the N_in -> N_out structure of their first few blocks
     def vgg_block_small(self, N_in, N_out):
@@ -110,7 +114,7 @@ class ConventionalVGG(nn.Module):
             nn.Conv1d(N_in, N_out, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Conv1d(N_out, N_out, kernel_size=3, padding=1),
-            nn.MaxPool1d(2),
+            nn.MaxPool1d(2, stride=2),
         )
 
     # copies the N_in -> N_out -> N_out conv structure of rest of blocks
@@ -125,7 +129,7 @@ class ConventionalVGG(nn.Module):
             nn.Conv1d(N_out, N_out, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Conv1d(N_out, N_out, kernel_size=3, padding=1),
-            nn.MaxPool1d(2),
+            nn.MaxPool1d(2, stride=2),
         )
 
     def forward(self, x: torch.tensor):
@@ -136,9 +140,9 @@ class ConventionalVGG(nn.Module):
         # global avg pooling hack (in reality didnt want to do weird flattening stuff)
         x = torch.mean(x, dim=2)
 
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
+        x = self.fc1(x)
+        # x = F.relu(self.fc2(x))
+        # x = self.fc3(x)
         return x
 
 
@@ -239,8 +243,6 @@ class ComplexResidualBlock(nn.Module):
 class ComplexResNet(nn.Module):
     def __init__(self):
         super().__init__()
-
-        self.activation = cvnn.zReLU()
 
         self.residual = nn.Sequential(
             ComplexResidualBlock(1, 64),
