@@ -156,7 +156,9 @@ def _whiten2x2_batch_norm(
             running_mean += momentum * (mean.data.squeeze() - running_mean)
 
     else:
-        mean = running_mean
+        # broadcast to the shape [2, 1, F, 1] to be compatible with input
+        # [2, B, F, ...]. make real since its already stacked [real, imag] anyways
+        mean = torch.real(running_mean.view(2, *tail))
 
     # Center the batch
     x -= mean
@@ -257,6 +259,7 @@ def batch_norm(
     assert (weight is None and bias is None) or (weight is not None and bias is not None)
 
     # stack along the first axis
+    # x = torch.stack(x.rect, dim=2)
     x = torch.stack((torch.real(x), torch.imag(x)))
 
     # whiten
@@ -270,7 +273,6 @@ def batch_norm(
     )
 
     # apply affine transformation
-    a = z.isnan()
     if weight is not None and bias is not None:
         shape = 1, x.shape[2], *([1] * (x.dim() - 3))
         weight = weight.view(2, 2, *shape)

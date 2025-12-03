@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from complex_batchnorm import BatchNorm1d as ComplexBatchNorm1d
 from complextorch import nn as cvnn
 import argparse
+from tqdm import tqdm
 
 
 class IQDataset(Dataset):
@@ -109,7 +110,6 @@ class ConventionalVGG(nn.Module):
             nn.Conv1d(N_in, N_out, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Conv1d(N_out, N_out, kernel_size=3, padding=1),
-            nn.ReLU(),
             nn.MaxPool1d(2),
         )
 
@@ -125,7 +125,6 @@ class ConventionalVGG(nn.Module):
             nn.Conv1d(N_out, N_out, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Conv1d(N_out, N_out, kernel_size=3, padding=1),
-            nn.ReLU(),
             nn.MaxPool1d(2),
         )
 
@@ -139,7 +138,7 @@ class ConventionalVGG(nn.Module):
 
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
+        x = self.fc3(x)
         return x
 
 
@@ -194,7 +193,7 @@ class ResNet(nn.Module):
         x = self.residual(x)
         # global average pooling
         x = torch.mean(x, dim=2)
-        return F.relu(self.fc(x))
+        return self.fc(x)
 
 
 class ComplexResidualBlock(nn.Module):
@@ -257,7 +256,7 @@ class ComplexResNet(nn.Module):
         x = self.residual(x)
         # global average pooling
         x = torch.mean(x, dim=2)
-        return self.activation(self.fc(x))
+        return self.fc(x)
 
 
 # inspired by https://arxiv.org/abs/1909.13299
@@ -309,22 +308,25 @@ def train(dataloader, model, is_complex, loss_fn, optimizer, epochs):
 def evaluate(dataloader, model, loss_fn, is_complex):
     size = len(dataloader.dataset)
     num_batches = len(dataloader)
+    batch_size = dataloader.batch_size
     model.eval()
     test_loss = 0
     correct = 0
 
     with torch.no_grad():
-        for X, y in dataloader:
+        for X, y in tqdm(dataloader):
             if torch.cuda.is_available():
                 X = X.to("cuda:0")
                 y = y.to("cuda:0")
-            batch_size = X.shape[0]
             if is_complex:
                 X = X.reshape(batch_size, 1, -1)
+                # pass
             else:
                 X = X.reshape(batch_size, 2, -1)
             pred = model(X)
             test_loss += loss_fn(pred, y).item()
+            if is_complex:
+                pred = torch.real(pred)
             correct += (pred.argmax(1) == y.argmax(1)).type(torch.float).sum().item()
     test_loss /= num_batches
     correct /= size
@@ -361,7 +363,10 @@ def main():
     parser.add_argument(
         "--eval-only", action="store_true", help="only run evaluation on the test set"
     )
-    parser.add_argument("--load-model-path", type=str, help="file path of model to load")
+    parser.add_argument(
+        "--resume-checkpoint", "-c", action="store_true", help="resumes training from a checkpoint"
+    )
+    parser.add_argument("--load-path", type=str, help="file path of model to load")
     print(torch.__version__)
     print(torch.cuda.is_available())
 
@@ -374,7 +379,8 @@ def main():
     save_path = args.save_path
     save_model = args.save
     eval_only = args.eval_only
-    load_model_path = args.load_model_path
+    load_model_path = args.load_path
+    load_checkpoint = args.resume_checkpoint
 
     print(
         f"Using dataset={dataset_root}, model={selected_model}, use_complex={use_complex_inputs}, "
@@ -382,7 +388,7 @@ def main():
     )
     train_dataset = IQDataset(dataset_root, max_per_class=1000, use_complex=use_complex_inputs)
 
-    loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
     if selected_model == "resnet":
         model = ResNet()
@@ -398,13 +404,20 @@ def main():
 
     if eval_only:
         if load_model_path is None:
-            print("Must provide --load-model path when using --eval-only")
+            print("Must provide --load-path when using --eval-only")
             return
         model.load_state_dict(torch.load(load_model_path, weights_only=True))
-        test_dataset = IQDataset(dataset_root, max_per_class=10000, use_complex=use_complex_inputs)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        test_dataset = IQDataset(dataset_root, max_per_class=1000, use_complex=use_complex_inputs)
+        test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True, num_workers=0)
         evaluate(test_loader, model, AverageCrossEntropyLoss(), use_complex_inputs)
         return
+
+    if load_checkpoint:
+        if load_model_path is None:
+            print("Must provide --load-path when using --resume-checkpoint")
+            return
+        model.load_state_dict(torch.load(load_model_path, weights_only=True))
+        print(f"Resuming training from checkpoint {load_model_path}")
 
     train(loader, model, use_complex_inputs, AverageCrossEntropyLoss(), optim, args.epochs)
 
@@ -415,7 +428,7 @@ def main():
         print(f"Model saved to {save_path}")
 
     test_dataset = IQDataset(dataset_root, max_per_class=1000, use_complex=use_complex_inputs)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
     evaluate(test_loader, model, AverageCrossEntropyLoss(), use_complex_inputs)
 
 
