@@ -11,6 +11,7 @@ import argparse
 from tqdm import tqdm
 from torch.profiler import profile, ProfilerActivity, record_function
 
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 class IQDataset(Dataset):
     def __init__(self, root_dir, max_per_class=50, transform=None, use_complex=False):
@@ -96,6 +97,7 @@ class ConventionalVGG(nn.Module):
             self.vgg_block_small(2, 64),
             self.vgg_block_small(64, 128),
             self.vgg_block_small(128, 256),
+            self.vgg_block_small(256, 512),
             # self.vgg_block_big(128, 128),
             # self.vgg_block_big(256, 512),
             # self.vgg_block_big(256, 512),
@@ -105,8 +107,8 @@ class ConventionalVGG(nn.Module):
 
         # further downsample with linear layers
         # maybe this is unnecessary just 128 -> 4
-        self.fc1 = nn.Linear(256, 4)
-        # self.fc2 = nn.Linear(64, 32)
+        self.fc1 = nn.Linear(512, 64)
+        self.fc2 = nn.Linear(64, 4)
         # self.fc3 = nn.Linear(32, 4)
 
     # copies the N_in -> N_out structure of their first few blocks
@@ -141,8 +143,8 @@ class ConventionalVGG(nn.Module):
         # global avg pooling hack (in reality didnt want to do weird flattening stuff)
         x = torch.mean(x, dim=2)
 
-        x = self.fc1(x)
-        # x = F.relu(self.fc2(x))
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
         # x = self.fc3(x)
         return x
 
@@ -317,6 +319,7 @@ def evaluate(dataloader, model, loss_fn, is_complex):
     model.eval()
     test_loss = 0
     correct = 0
+    confusion_matrix = torch.zeros(4, 4).to(DEVICE)
 
     with torch.no_grad():
         for X, y in tqdm(dataloader):
@@ -333,12 +336,18 @@ def evaluate(dataloader, model, loss_fn, is_complex):
             test_loss += loss_fn(pred, y)
             if is_complex:
                 pred = torch.real(pred)
-            correct += (pred.argmax(1) == y.argmax(1)).sum()
+            
+            pred_idx = pred.argmax(1)
+            y_idx = y.argmax(1)
+            correct += (pred_idx == y_idx).sum()
+            for t, p in zip(y_idx.view(-1), pred_idx.view(-1)):
+                confusion_matrix[t.long()][p.long()] += 1
     test_loss = test_loss.item()
     test_loss /= num_batches
     correct = correct.item()
     correct /= size
     print(f"Test Error: \n Accuracy: {(100 * correct):>0.1f}%, Avg loss: {test_loss:>8f} \n")
+    print("Confusion Matrix\n ", confusion_matrix)
 
 
 def main():
@@ -394,7 +403,7 @@ def main():
         f"Using dataset={dataset_root}, model={selected_model}, use_complex={use_complex_inputs}, "
         f"batch_size={batch_size}"
     )
-    train_dataset = IQDataset(dataset_root, max_per_class=1000, use_complex=use_complex_inputs)
+    train_dataset = IQDataset(dataset_root, max_per_class=10000, use_complex=use_complex_inputs)
 
     loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
@@ -415,7 +424,7 @@ def main():
             print("Must provide --load-path when using --eval-only")
             return
         model.load_state_dict(torch.load(load_model_path, weights_only=True))
-        test_dataset = IQDataset(dataset_root, max_per_class=20, use_complex=use_complex_inputs)
+        test_dataset = IQDataset(dataset_root, max_per_class=1000, use_complex=use_complex_inputs)
         test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=torch.cuda.is_available())
         # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True, record_shapes=True) as prof:
         #     with record_function("model_inference"):
@@ -440,7 +449,7 @@ def main():
         print(f"Model saved to {save_path}")
 
     test_dataset = IQDataset(dataset_root, max_per_class=1000, use_complex=use_complex_inputs)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True, num_workers=0)
     evaluate(test_loader, model, AverageCrossEntropyLoss(), use_complex_inputs)
 
 
