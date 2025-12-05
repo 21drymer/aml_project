@@ -10,6 +10,8 @@ from complextorch import nn as cvnn
 import argparse
 from tqdm import tqdm
 from torch.profiler import profile, ProfilerActivity, record_function
+import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -192,8 +194,9 @@ class ResNet(nn.Module):
             ResidualBlock(64, 128),
             ResidualBlock(128, 256),
             ResidualBlock(256, 256),
+            ResidualBlock(256, 512),
         )
-        self.fc = nn.Linear(256, 4)
+        self.fc = nn.Linear(512, 4)
 
     def forward(self, x: torch.tensor):
         # x: (batch, 2, N)
@@ -252,9 +255,10 @@ class ComplexResNet(nn.Module):
             ComplexResidualBlock(64, 128),
             ComplexResidualBlock(128, 256),
             ComplexResidualBlock(256, 256),
+            ComplexResidualBlock(256, 512),
         )
 
-        self.fc = nn.Linear(256, 4)
+        self.fc = nn.Linear(512, 4)
 
     def forward(self, x: torch.tensor):
         # x: (batch, 2, N)
@@ -282,10 +286,37 @@ class AverageCrossEntropyLoss(nn.Module):
 
         return self.loss_fn_real(input, target)
 
+def plot_confusion_matrix(cm, class_names):
+    """
+    Returns a matplotlib figure containing the plotted confusion matrix.
+    """
+    figure = plt.figure(figsize=(8, 8))
+    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title("Confusion Matrix")
+    plt.colorbar()
+    tick_marks = np.arange(len(class_names))
+    plt.xticks(tick_marks, class_names, rotation=45)
+    plt.yticks(tick_marks, class_names)
 
-def train(dataloader, model, is_complex, loss_fn, optimizer, epochs):
+    # Normalize the confusion matrix.
+    cm_norm = np.around(cm.astype('float') / cm.sum(axis=1)[:, np.newaxis], decimals=2)
+
+    threshold = cm.max() / 2.
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            color = "white" if cm[i, j] > threshold else "black"
+            plt.text(j, i, f"{int(cm[i, j])}\n({cm_norm[i,j]})", horizontalalignment="center", color=color)
+
+    plt.tight_layout()
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    return figure
+
+def train(dataloader, model, is_complex, loss_fn, optimizer, epochs, writer):
     size = len(dataloader.dataset)
     batch_size = dataloader.batch_size
+    
+    global_step = 0
 
     for epoch in range(epochs):
         model.train()
@@ -294,25 +325,55 @@ def train(dataloader, model, is_complex, loss_fn, optimizer, epochs):
                 if is_complex and not X.is_contiguous():
                     X = X.contiguous()
                 if torch.cuda.is_available():
-                    X = X.to("cuda:0", non_blocking=True)
-                    y = y.to("cuda:0", non_blocking=True)
-                # Compute prediction and loss
+                    X = X.to(DEVICE, non_blocking=True)
+                    y = y.to(DEVICE, non_blocking=True)
+                
                 if is_complex:
                     x = X.view(batch_size, 1, -1)
                 else:
                     x = X.reshape(batch_size, 2, -1)
+                
                 pred = model(x)
                 loss = loss_fn(pred, y)
 
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
+                
+                # --- TensorBoard: Log Training Loss per batch ---
+                writer.add_scalar('Loss/train', loss.item(), global_step)
+                global_step += 1
 
-                loss, current = loss.item(), batch * batch_size + len(X)
-                print(f"Epoch [{epoch + 1}/{epochs}], loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
+                # if batch % batch_size == 0: # Print less frequently to console
+                loss_val, current = loss.item(), batch * batch_size + len(X)
+                print(f"Epoch [{epoch + 1}/{epochs}], loss: {loss_val:>7f}  [{current:>5d}/{size:>5d}]")
+        
 
+def f1(confusion_matrix: torch.Tensor, average='macro', eps=1e-07):
+    # diag -> tp
+    tp = confusion_matrix.diag()
+    # fp -> sum of columns minus diag
+    fp = confusion_matrix.sum(dim=0) - tp
+    # fn -> sum of rows minus diag
+    fn = confusion_matrix.sum(dim=1) - tp
 
-def evaluate(dataloader, model, loss_fn, is_complex):
+    if average == "micro":
+        total_tp = tp.sum()
+        total_fp = fp.sum()
+        total_fn = fn.sum()
+        precision = total_tp / (total_tp + total_fp + eps)
+        recall = total_tp / (total_tp + total_fn + eps)
+        return 2 * precision * recall / (precision + recall + eps)
+    precision_cls = tp / (tp + fp + eps)
+    recall_cls = tp / (tp + fn + eps)
+    f1_cls = 2 * (precision_cls * recall_cls) / (precision_cls + recall_cls + eps)    
+    if average == "macro":
+        return f1_cls.mean()
+    if average == "none":
+        return f1_cls
+    return NotImplementedError("use a strategy!")
+
+def evaluate(dataloader, model, loss_fn, is_complex, writer=None, epoch=0):
     size = len(dataloader.dataset)
     num_batches = len(dataloader)
     batch_size = dataloader.batch_size
@@ -322,91 +383,84 @@ def evaluate(dataloader, model, loss_fn, is_complex):
     confusion_matrix = torch.zeros(4, 4).to(DEVICE)
 
     with torch.no_grad():
-        for X, y in tqdm(dataloader):
+        for X, y in tqdm(dataloader, desc="Evaluating"):
             if is_complex and not X.is_contiguous():
                 X = X.contiguous()
             if torch.cuda.is_available():
-                X = X.to("cuda:0", non_blocking=True)
-                y = y.to("cuda:0", non_blocking=True)
+                X = X.to(DEVICE, non_blocking=True)
+                y = y.to(DEVICE, non_blocking=True)
             if is_complex:
                 x = X.view(batch_size, 1, -1)
             else:
                 x = X.reshape(batch_size, 2, -1)
+            
             pred = model(x)
             test_loss += loss_fn(pred, y)
+            
             if is_complex:
                 pred = torch.real(pred)
             
             pred_idx = pred.argmax(1)
             y_idx = y.argmax(1)
             correct += (pred_idx == y_idx).sum()
+            
             for t, p in zip(y_idx.view(-1), pred_idx.view(-1)):
                 confusion_matrix[t.long()][p.long()] += 1
     test_loss = test_loss.item()
     test_loss /= num_batches
     correct = correct.item()
-    correct /= size
-    print(f"Test Error: \n Accuracy: {(100 * correct):>0.1f}%, Avg loss: {test_loss:>8f} \n")
+    accuracy = correct / size
+    
+    print(f"Test Error: \n Accuracy: {(100 * accuracy):>0.1f}%, Avg loss: {test_loss:>8f} \n")
     print("Confusion Matrix\n ", confusion_matrix)
+    print("F1 per class\n ", f1(confusion_matrix, average="none"))
+    print("Macro F1\n ", f1(confusion_matrix, average="macro"))
+    print("Micro F1\n ", f1(confusion_matrix, average="micro"))
+
+    # --- TensorBoard: Log Metrics ---
+    if writer:
+        writer.add_scalar('Loss/test', test_loss, epoch)
+        writer.add_scalar('Accuracy/test', accuracy, epoch)
+        
+        # Log Confusion Matrix Image
+        cm_np = confusion_matrix.cpu().numpy()
+        fig = plot_confusion_matrix(cm_np, dataloader.dataset.class_map.keys())
+        writer.add_figure('Confusion Matrix', fig, epoch)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train an IQ model")
-    parser.add_argument(
-        "--dataset",
-        "-d",
-        type=str,
-        default="./data",
-        help="path to dataset root directory (contains `signals/`)",
-    )
-    parser.add_argument(
-        "--model",
-        "-m",
-        type=str,
-        choices=["resnet", "vgg", "complex"],
-        default="resnet",
-        required=True,
-        help="model architecture to use",
-    )
+    parser.add_argument("--dataset", "-d", type=str, default="./data", help="path to dataset root")
+    parser.add_argument("--model", "-m", type=str, choices=["resnet", "vgg", "complex"], default="resnet", required=True)
     parser.add_argument("--batch", type=int, default=5, help="training batch size")
     parser.add_argument("--epochs", type=int, default=10, help="number of training epochs")
-    parser.add_argument(
-        "--save-path",
-        type=str,
-        default="./model",
-        help="path to save model checkpoint after training",
-    )
+    parser.add_argument("--save-path", type=str, default="./model", help="path to save model")
     parser.add_argument("--save", "-s", action="store_true")
-    parser.add_argument(
-        "--eval-only", action="store_true", help="only run evaluation on the test set"
-    )
-    parser.add_argument(
-        "--resume-checkpoint", "-c", action="store_true", help="resumes training from a checkpoint"
-    )
+    parser.add_argument("--eval-only", action="store_true", help="only run evaluation")
+    parser.add_argument("--resume-checkpoint", "-c", action="store_true", help="resumes training")
     parser.add_argument("--load-path", type=str, help="file path of model to load")
-    print(torch.__version__)
-    print(torch.cuda.is_available())
+    parser.add_argument("--log-dir", type=str, default="runs", help="TensorBoard log directory")
 
     args = parser.parse_args()
+
+    # --- TensorBoard Writer Initialization ---
+    run_name = f"{args.model}_batch{args.batch}_data{os.path.basename(args.dataset)}{"_eval" if args.eval_only else ""}"
+    writer = SummaryWriter(log_dir=os.path.join(args.log_dir, run_name))
+    print(f"Logging to TensorBoard directory: {writer.log_dir}")
 
     dataset_root = args.dataset
     selected_model = args.model
     use_complex_inputs = selected_model == "complex"
     batch_size = args.batch
-    save_path = args.save_path
-    save_model = args.save
-    eval_only = args.eval_only
-    load_model_path = args.load_path
-    load_checkpoint = args.resume_checkpoint
 
-    print(
-        f"Using dataset={dataset_root}, model={selected_model}, use_complex={use_complex_inputs}, "
-        f"batch_size={batch_size}"
-    )
-    train_dataset = IQDataset(dataset_root, max_per_class=10000, use_complex=use_complex_inputs)
+    print(f"Using dataset={dataset_root}, model={selected_model}, use_complex={use_complex_inputs}")
 
-    loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    train_dataset = IQDataset(dataset_root, max_per_class=5000, use_complex=use_complex_inputs)
+    test_dataset = IQDataset(dataset_root, max_per_class=1000, use_complex=use_complex_inputs)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
+    # Init Model
     if selected_model == "resnet":
         model = ResNet()
     elif selected_model == "vgg":
@@ -414,44 +468,41 @@ def main():
     else:
         model = ComplexResNet()
         model = model.to(torch.complex128)
+    
     if torch.cuda.is_available():
-        model = model.to("cuda:0")
+        model = model.to(DEVICE)
 
-    optim = torch.optim.Adam(model.parameters())
+    optim = torch.optim.AdamW(model.parameters())
 
-    if eval_only:
-        if load_model_path is None:
+    if args.eval_only:
+        if args.load_path is None:
             print("Must provide --load-path when using --eval-only")
             return
-        model.load_state_dict(torch.load(load_model_path, weights_only=True))
-        test_dataset = IQDataset(dataset_root, max_per_class=1000, use_complex=use_complex_inputs)
-        test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=torch.cuda.is_available())
-        # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True, record_shapes=True) as prof:
-        #     with record_function("model_inference"):
-        evaluate(test_loader, model, AverageCrossEntropyLoss(), use_complex_inputs)
-        # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-        # prof.export_chrome_trace(f"trace{"_complex" if use_complex_inputs else ""}.json")
+        model.load_state_dict(torch.load(args.load_path, weights_only=True))
+        evaluate(test_loader, model, AverageCrossEntropyLoss(), use_complex_inputs, writer, epoch=0)
+        writer.close()
         return
 
-    if load_checkpoint:
-        if load_model_path is None:
+    if args.resume_checkpoint:
+        if args.load_path is None:
             print("Must provide --load-path when using --resume-checkpoint")
             return
-        model.load_state_dict(torch.load(load_model_path, weights_only=True))
-        print(f"Resuming training from checkpoint {load_model_path}")
+        model.load_state_dict(torch.load(args.load_path, weights_only=True))
+        print(f"Resuming training from checkpoint {args.load_path}")
 
-    train(loader, model, use_complex_inputs, AverageCrossEntropyLoss(), optim, args.epochs)
+    # Pass test_loader to train loop so we can get validation curves in TensorBoard
+    train(train_loader, model, use_complex_inputs, AverageCrossEntropyLoss(), optim, args.epochs, writer)
 
-    if save_model:
-        os.makedirs(save_path, exist_ok=True)
-        save_path = os.path.join(save_path, f"{selected_model}.pt")
+    if args.save:
+        os.makedirs(args.save_path, exist_ok=True)
+        save_path = os.path.join(args.save_path, f"{selected_model}.pt")
         torch.save(model.state_dict(), save_path)
         print(f"Model saved to {save_path}")
 
-    test_dataset = IQDataset(dataset_root, max_per_class=1000, use_complex=use_complex_inputs)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True, num_workers=0)
-    evaluate(test_loader, model, AverageCrossEntropyLoss(), use_complex_inputs)
-
+    # Final eval
+    evaluate(test_loader, model, AverageCrossEntropyLoss(), use_complex_inputs, writer, args.epochs)
+    
+    writer.close()
 
 if __name__ == "__main__":
     main()
